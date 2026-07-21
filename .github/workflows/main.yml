@@ -5,6 +5,8 @@ on:
       - master
       - 'release/**'
   pull_request:
+permissions:
+  contents: read
 jobs:
   main:
     strategy:

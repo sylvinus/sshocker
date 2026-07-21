@@ -4,6 +4,8 @@ on:
     tags:
     - 'v*'
     - 'test-action-release-*'
+permissions:
+  contents: read
 jobs:
   release:
     strategy:
@@ -12,6 +14,10 @@ jobs:
         os: [ubuntu-24.04]
     runs-on: ${{ matrix.os }}
     timeout-minutes: 20
+    permissions:
+      contents: write  # for releases
+      id-token: write  # for provenances
+      attestations: write  # for provenances
     steps:
     - uses: actions/checkout@v7
       with:
