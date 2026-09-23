@@ -8,6 +8,8 @@ import (
 	"os"
 	"path"
 	"strings"
+	"sync"
+	"time"
 
 	"github.com/pkg/sftp"
 )
@@ -26,7 +28,13 @@ type rootedHandlers struct {
 	readonly      bool
 	readonlyNames []string
 	rootedSys
+
+	mu           sync.Mutex
+	noopRemovals map[string]time.Time // expiry, keyed by request path
 }
+
+// noopRemovalTTL bounds how long an ExpectRemove token waits for the guest.
+const noopRemovalTTL = 5 * time.Second
 
 func newRootedServer(rwc io.ReadWriteCloser, localPath string, readonly bool, readonlyNames []string) (*sftp.RequestServer, *rootedHandlers, error) {
 	root, err := os.OpenRoot(localPath)
@@ -44,6 +52,7 @@ func newRootedServer(rwc io.ReadWriteCloser, localPath string, readonly bool, re
 		readonly:      readonly,
 		readonlyNames: readonlyNames,
 		rootedSys:     sys,
+		noopRemovals:  make(map[string]time.Time),
 	}
 	handlers := sftp.Handlers{FileGet: h, FilePut: h, FileCmd: h, FileList: h}
 	srv := sftp.NewRequestServer(rwc, handlers, sftp.WithStartDirectory(startDirectory(h.rootPath)))
@@ -52,6 +61,33 @@ func newRootedServer(rwc io.ReadWriteCloser, localPath string, readonly bool, re
 
 func (h *rootedHandlers) Close() error {
 	return errors.Join(h.root.Close(), h.rootedSys.close())
+}
+
+// expectRemove makes the next Remove or Rmdir request for p, within noopRemovalTTL,
+// succeed without touching the host. p is a host path under the root.
+func (h *rootedHandlers) expectRemove(p string) {
+	p = slashPath(p)
+	now := time.Now()
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	for k, expiry := range h.noopRemovals {
+		if now.After(expiry) {
+			delete(h.noopRemovals, k)
+		}
+	}
+	h.noopRemovals[p] = now.Add(noopRemovalTTL)
+}
+
+func (h *rootedHandlers) consumeNoopRemoval(p string) bool {
+	p = path.Clean(p)
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	expiry, ok := h.noopRemovals[p]
+	if !ok {
+		return false
+	}
+	delete(h.noopRemovals, p)
+	return time.Now().Before(expiry)
 }
 
 // rel maps a request path to a path relative to the root.
@@ -145,6 +181,11 @@ func (h *rootedHandlers) Filecmd(r *sftp.Request) error {
 	case "Link":
 		return h.link(r)
 	case "Remove", "Rmdir":
+		// The guest agent removes a path deleted on the host, so that the guest emits IN_DELETE.
+		// The path may have been created again on the host since, so it must not be removed.
+		if h.consumeNoopRemoval(r.Filepath) {
+			return nil
+		}
 		return h.remove(r)
 	case "Mkdir":
 		return h.mkdir(r)
