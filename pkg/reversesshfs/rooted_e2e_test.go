@@ -146,6 +146,81 @@ func TestRootedSSHFS(t *testing.T) {
 			t.Errorf("%s: no IN_ATTRIB event in the mount", f)
 		}
 	}
+
+	// Relay a host deletion: the hostagent calls ExpectRemove, then the guest agent removes the path.
+	for _, tc := range []struct {
+		name        string
+		recreate    bool
+		guestSeen   bool
+		guestListed bool
+		delay       time.Duration
+	}{
+		{name: "src/gone.txt", guestSeen: true},
+		{name: "src/listed.txt", guestListed: true},
+		{name: ".git/index.lock", guestSeen: true},
+		{name: "src/later.txt", guestSeen: true, delay: 2 * time.Second},
+		{name: "src/again.txt", guestSeen: true, recreate: true},
+		{name: "src/unseen.txt"},
+	} {
+		hostPath := filepath.Join(root, tc.name)
+		if err := os.WriteFile(hostPath, []byte("old"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if tc.guestSeen {
+			if _, err := os.Stat(filepath.Join(mnt, tc.name)); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if tc.guestListed {
+			if _, err := os.ReadDir(filepath.Dir(filepath.Join(mnt, tc.name))); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if err := os.Remove(hostPath); err != nil {
+			t.Fatal(err)
+		}
+		if tc.recreate {
+			if err := os.WriteFile(hostPath, []byte("new"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+		}
+		time.Sleep(tc.delay)
+		h.expectRemove(hostPath)
+		got := gotDeleteEvent(t, filepath.Join(mnt, tc.name))
+		t.Logf("%s (seen: %v, listed: %v, delay: %v): IN_DELETE: %v", tc.name, tc.guestSeen, tc.guestListed, tc.delay, got)
+		if tc.guestSeen && !got {
+			t.Errorf("%s: no IN_DELETE event in the mount", tc.name)
+		}
+		if tc.recreate {
+			if b, err := os.ReadFile(hostPath); err != nil || string(b) != "new" {
+				t.Errorf("%s: the recreated file was modified: %q, %v", tc.name, b, err)
+			}
+		}
+	}
+}
+
+func gotDeleteEvent(t *testing.T, p string) bool {
+	t.Helper()
+	fd, err := unix.InotifyInit1(unix.IN_CLOEXEC | unix.IN_NONBLOCK)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer unix.Close(fd)
+	if _, err := unix.InotifyAddWatch(fd, filepath.Dir(p), unix.IN_DELETE); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(p); err != nil {
+		t.Logf("remove %s: %v", p, err)
+		return false
+	}
+	buf := make([]byte, 4096)
+	for range 20 {
+		if n, err := unix.Read(fd, buf); err == nil && n > 0 {
+			return true
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	return false
 }
 
 func gotAttribEvent(t *testing.T, p string, mtime time.Time) bool {

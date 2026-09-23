@@ -25,6 +25,12 @@ var (
 // It also creates the symlinks "gitlink" -> ".git" and "configlink" -> ".git/config".
 func setupRooted(t *testing.T, readonly bool) (*sftp.Client, string) {
 	t.Helper()
+	c, root, _ := setupRootedHandlers(t, readonly)
+	return c, root
+}
+
+func setupRootedHandlers(t *testing.T, readonly bool) (*sftp.Client, string, *rootedHandlers) {
+	t.Helper()
 	tmp := t.TempDir()
 	root := filepath.Join(tmp, "root")
 	for _, d := range []string{filepath.Join(root, ".git", "hooks"), filepath.Join(root, "src"), filepath.Join(tmp, "outside")} {
@@ -64,7 +70,7 @@ func setupRooted(t *testing.T, readonly bool) (*sftp.Client, string) {
 		client.Close()
 		<-done
 	})
-	return client, root
+	return client, root, h
 }
 
 func assertUnchanged(t *testing.T, root string) {
@@ -286,6 +292,59 @@ func TestRootedNoopTimes(t *testing.T) {
 	}
 	if err := c.Chtimes(filepath.Join(root, ".git", "missing"), mtime, mtime); err == nil {
 		t.Error("utimes on a missing file: expected an error")
+	}
+	assertUnchanged(t, root)
+}
+
+// TestRootedNoopRemoval checks the removal used to relay host deletions.
+func TestRootedNoopRemoval(t *testing.T) {
+	c, root, h := setupRootedHandlers(t, false)
+	p := func(s string) string { return filepath.Join(root, s) }
+
+	// The path was created again on the host before the guest removed it.
+	h.expectRemove(p("src/main.go"))
+	if err := c.Remove(p("src/main.go")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(p("src/main.go")); err != nil {
+		t.Fatalf("the file was removed: %v", err)
+	}
+	// The token is consumed.
+	if err := c.Remove(p("src/main.go")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(p("src/main.go")); err == nil {
+		t.Fatal("the file was not removed")
+	}
+
+	h.expectRemove(p("src"))
+	if err := c.RemoveDirectory(p("src")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(p("src")); err != nil {
+		t.Fatalf("the directory was removed: %v", err)
+	}
+
+	// A git lock file deleted on the host.
+	h.expectRemove(p(".git/index.lock"))
+	if err := c.Remove(p(".git/index.lock")); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Remove(p(".git/index.lock")); err == nil {
+		t.Fatal("expected an error")
+	}
+	h.expectRemove(p(".git/config"))
+	if err := c.Remove(p(".git/config")); err != nil {
+		t.Fatal(err)
+	}
+
+	// An expired token.
+	h.expectRemove(p(".git/config"))
+	h.mu.Lock()
+	h.noopRemovals[p(".git/config")] = time.Now().Add(-time.Second)
+	h.mu.Unlock()
+	if err := c.Remove(p(".git/config")); err == nil {
+		t.Fatal("expected an error")
 	}
 	assertUnchanged(t, root)
 }

@@ -13,6 +13,7 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"sync/atomic"
 
 	"github.com/lima-vm/sshocker/pkg/ssh"
 	"github.com/lima-vm/sshocker/pkg/util"
@@ -44,6 +45,21 @@ type ReverseSSHFS struct {
 	// ReadonlyNames makes a path read-only when any of its components is one of these names
 	// (compared case-insensitively). Requires DriverBuiltin on Linux or macOS.
 	ReadonlyNames []string
+
+	rooted atomic.Pointer[rootedHandlers]
+}
+
+// ExpectRemove makes the next removal of hostPath requested by the remote, within a few seconds,
+// succeed without touching hostPath. It is used to relay a local deletion to the remote,
+// by removing the path there, which emits an inotify event on the remote.
+// It returns false when unsupported, i.e., when not using DriverBuiltin on Linux or macOS.
+func (rsf *ReverseSSHFS) ExpectRemove(hostPath string) bool {
+	h := rsf.rooted.Load()
+	if h == nil {
+		return false
+	}
+	h.expectRemove(hostPath)
+	return true
 }
 
 func (rsf *ReverseSSHFS) Prepare() error {
@@ -209,6 +225,7 @@ func (rsf *ReverseSSHFS) Start() error {
 			builtinSftpServer, err = sftp.NewServer(stdio, sftpOpts...)
 		} else {
 			builtinSftpServer, rooted, err = newRootedServer(stdio, rsf.LocalPath, rsf.Readonly, rsf.ReadonlyNames)
+			rsf.rooted.Store(rooted)
 		}
 		if err != nil {
 			return err
