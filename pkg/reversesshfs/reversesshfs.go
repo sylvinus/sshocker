@@ -40,6 +40,10 @@ type ReverseSSHFS struct {
 	sshCmd                  *exec.Cmd
 	opensshSftpServerCmd    *exec.Cmd
 	SSHFSAdditionalArgs     []string
+
+	// ReadonlyNames makes a path read-only when any of its components is one of these names
+	// (compared case-insensitively). Requires DriverBuiltin on Linux or macOS.
+	ReadonlyNames []string
 }
 
 func (rsf *ReverseSSHFS) Prepare() error {
@@ -158,6 +162,10 @@ func (rsf *ReverseSSHFS) Start() error {
 	case DriverBuiltin, DriverOpensshSftpServer:
 		// NOP
 	case "", DriverAuto:
+		if len(rsf.ReadonlyNames) > 0 {
+			driver = DriverBuiltin
+			break
+		}
 		var err error
 		driver, opensshSftpServerBinary, err = DetectDriver(opensshSftpServerBinary)
 		if err != nil {
@@ -167,7 +175,13 @@ func (rsf *ReverseSSHFS) Start() error {
 	default:
 		return fmt.Errorf("unknown driver %q", driver)
 	}
-	var builtinSftpServer *sftp.Server
+	if len(rsf.ReadonlyNames) > 0 && driver != DriverBuiltin {
+		return fmt.Errorf("ReadonlyNames requires driver %q, got %q", DriverBuiltin, driver)
+	}
+	var (
+		builtinSftpServer interface{ Serve() error }
+		rooted            *rootedHandlers
+	)
 	switch driver {
 	case DriverBuiltin:
 		stdinPipe, err := rsf.sshCmd.StdinPipe()
@@ -182,15 +196,20 @@ func (rsf *ReverseSSHFS) Start() error {
 			ReadCloser:  stdoutPipe,
 			WriteCloser: stdinPipe,
 		}
-		var sftpOpts []sftp.ServerOption
-		if rsf.Readonly {
-			sftpOpts = append(sftpOpts, sftp.ReadOnly())
+		if runtime.GOOS == "windows" {
+			if len(rsf.ReadonlyNames) > 0 {
+				return errors.New("ReadonlyNames is not supported on Windows")
+			}
+			var sftpOpts []sftp.ServerOption
+			if rsf.Readonly {
+				sftpOpts = append(sftpOpts, sftp.ReadOnly())
+			}
+			// NOTE: sftp.NewServer doesn't support specifying the root.
+			// https://github.com/pkg/sftp/pull/238
+			builtinSftpServer, err = sftp.NewServer(stdio, sftpOpts...)
+		} else {
+			builtinSftpServer, rooted, err = newRootedServer(stdio, rsf.LocalPath, rsf.Readonly, rsf.ReadonlyNames)
 		}
-		// NOTE: sftp.NewServer doesn't support specifying the root.
-		// https://github.com/pkg/sftp/pull/238
-		//
-		// TODO: use sftp.NewRequestServer with custom handlers to mitigate potential vulnerabilities.
-		builtinSftpServer, err = sftp.NewServer(stdio, sftpOpts...)
 		if err != nil {
 			return err
 		}
@@ -234,6 +253,9 @@ func (rsf *ReverseSSHFS) Start() error {
 	switch driver {
 	case DriverBuiltin:
 		go func() {
+			if rooted != nil {
+				defer rooted.Close()
+			}
 			if srvErr := builtinSftpServer.Serve(); srvErr != nil {
 				if errors.Is(srvErr, io.EOF) {
 					logrus.WithError(srvErr).Debugf("sftp server for %v exited with EOF (negligible)", rsf.LocalPath)
